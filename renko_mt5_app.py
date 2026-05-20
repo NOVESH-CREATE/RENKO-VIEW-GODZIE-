@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 from dash import Dash, html, dcc, callback, Output, Input
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime
 print("=== MODULES IMPORTED ===", flush=True)
 
 if not mt5.initialize():
@@ -20,8 +20,8 @@ else:
     else:
         print("Failed to get account info")
 
-def get_renko_bricks(symbol, timeframe, box_size, num_bricks=140):
-    """Get Renko bricks that match Pine script logic with minute-based confirmation"""
+def get_all_renko_bricks(symbol, timeframe, box_size, num_bricks=140):
+    """Get ALL Renko bricks formed (both confirmed and unconfirmed) for numbering continuity"""
     rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, 1000)
     if rates is None:
         return None, None
@@ -44,7 +44,7 @@ def get_renko_bricks(symbol, timeframe, box_size, num_bricks=140):
     all_brick_times = [df['time'].iloc[0]]  # Time of each brick
     all_brick_trends = [0]            # Trend of each brick (0=no trend, 1=up, -1=down)
     
-    # Track which MT5 candle each brick came from for minute-based confirmation
+    # Track which MT5 candle each brick came from
     brick_source_candle_idx = [0]     # Index in df of the candle that contributed to this brick
     
     total_bricks = 0  # Total number of bricks created (for numbering)
@@ -127,24 +127,18 @@ def get_renko_bricks(symbol, timeframe, box_size, num_bricks=140):
                         
                         total_bricks += 1
     
-    # NOW APPLY MINUTE-BASED CONFIRMATION LOGIC
-    # A brick is CONFIRMED only if it came from a completed minute candle
-    # A brick is UNCONFIRMED if it came from the currently forming minute candle
-    
-    now = datetime.now()
-    current_minute_start = now.replace(second=0, microsecond=0)
-    
-    confirmed_bricks = []
-    unconfirmed_bricks = []  # Can contain MULTIPLE bricks from current minute
-    
-    # Skip the initial placeholder (index 0) which was just our starting point
+    # Create DataFrame with ALL bricks and their metadata
+    bricks_data = []
     start_idx = 1
     
+    # THE CRITICAL FIX: Identify the last candle in MT5 data (currently forming)
+    last_mt5_candle_idx = len(df) - 1
+    
     for i in range(start_idx, len(all_brick_closes)):
-        # Get the source candle index for this brick
-        source_candle_idx = brick_source_candle_idx[i]
-        source_candle_time = df['time'].iloc[source_candle_idx]
-        
+        # If the brick's source candle index is strictly less than the last candle index,
+        # it means the candle has fully closed -> Confirm the brick!
+        is_confirmed = brick_source_candle_idx[i] < last_mt5_candle_idx
+
         brick_data = {
             'brick_num': total_bricks - len(all_brick_closes) + i,  # Sequential numbering
             'open': all_brick_opens[i],
@@ -153,37 +147,22 @@ def get_renko_bricks(symbol, timeframe, box_size, num_bricks=140):
             'low': all_brick_lows[i],
             'time': all_brick_times[i],
             'trend': all_brick_trends[i],
-            'source_candle_time': source_candle_time,
-            'source_candle_idx': source_candle_idx
+            'source_candle_idx': brick_source_candle_idx[i],
+            'confirmed': is_confirmed  # Attach confirmation status directly
         }
-        
-        # CONFIRMATION LOGIC: Brick is confirmed only if source candle is COMPLETED
-        # A candle is completed if its time is BEFORE the start of current minute
-        if source_candle_time < current_minute_start:
-            # This brick came from a completed minute - CONFIRMED
-            brick_data['confirmed'] = True
-            confirmed_bricks.append(brick_data)
-        else:
-            # This brick came from the current forming minute - UNCONFIRMED
-            brick_data['confirmed'] = False
-            unconfirmed_bricks.append(brick_data)
+        bricks_data.append(brick_data)
     
-    # Keep only the most recent bricks for performance
-    # Combine confirmed and unconfirmed for display, then split back
-    all_bricks_for_display = confirmed_bricks + unconfirmed_bricks
-    if len(all_bricks_for_display) > num_bricks:
-        all_bricks_for_display = all_bricks_for_display[-num_bricks:]
+    bricks_df = pd.DataFrame(bricks_data) if bricks_data else pd.DataFrame()
+    
+    # Keep only the most recent bricks for performance (to prevent memory issues)
+    max_bricks_to_keep = max(num_bricks * 2, 200)  # Keep extra for numbering continuity
+    if len(bricks_df) > max_bricks_to_keep:
+        bricks_df = bricks_df.tail(max_bricks_to_keep).copy()
         # Renumber the bricks to be sequential for display
-        for i, brick in enumerate(all_bricks_for_display):
-            brick['brick_num'] = i
-        
-        # Split back into confirmed and unconfirmed
-        confirmed_bricks = [b for b in all_bricks_for_display if b['confirmed']]
-        unconfirmed_bricks = [b for b in all_bricks_for_display if not b['confirmed']]
+        for i in range(len(bricks_df)):
+            bricks_df.iloc[i, bricks_df.columns.get_loc('brick_num')] = i
     
-    # Return confirmed bricks as DataFrame (for EMA) and unconfirmed as list (for display)
-    confirmed_df = pd.DataFrame(confirmed_bricks) if confirmed_bricks else pd.DataFrame()
-    return confirmed_df, unconfirmed_bricks
+    return bricks_df, None
 
 def calculate_ema(close_prices, period=9):
     """Calculate EMA on confirmed close prices only"""
@@ -261,83 +240,46 @@ app.layout = html.Div([
      Input('interval-component', 'n_intervals')]
 )
 def update_chart(symbol, timeframe, box_size, num_bricks, n_intervals):
-    bricks_df, unconfirmed_list = get_renko_bricks(symbol, timeframe, box_size, num_bricks)
+    all_bricks_df, _ = get_all_renko_bricks(symbol, timeframe, box_size, num_bricks)
     
-    if bricks_df is None or (len(bricks_df) == 0 and len(unconfirmed_list) == 0):
+    if all_bricks_df is None or len(all_bricks_df) == 0:
         return go.Figure(), "No data available", ""
     
-    # Separate truly confirmed bricks (before current minute) for EMA calculation
-    now = datetime.now()
-    current_minute_start = now.replace(second=0, microsecond=0)
+    # ONLY SHOW CONFIRMED BRICKS
+    # We no longer rely on datetime.now() / server time synchronization.
+    # The 'confirmed' flag was reliably determined mathematically in the previous function.
+    confirmed_bricks = all_bricks_df[all_bricks_df['confirmed'] == True].copy()
     
-    truly_confirmed_bricks = bricks_df[bricks_df['time'] < current_minute_start].copy() if len(bricks_df) > 0 else pd.DataFrame()
-    current_minute_bricks = bricks_df[bricks_df['time'] >= current_minute_start].copy() if len(bricks_df) > 0 else pd.DataFrame()
-    
-    # Calculate EMA only on truly confirmed bricks (before current minute)
-    if len(truly_confirmed_bricks) > 0:
-        close_prices_for_ema = truly_confirmed_bricks['close'].tolist()
+    # Calculate EMA strictly on confirmed bricks
+    if len(confirmed_bricks) > 0:
+        close_prices_for_ema = confirmed_bricks['close'].tolist()
         ema_values = calculate_ema(close_prices_for_ema, period=9)
     else:
         ema_values = []
     
     fig = go.Figure()
     
-    # Add truly confirmed bricks (ONLY these are visible and used for EMA)
-    if len(truly_confirmed_bricks) > 0:
+    # Add ONLY confirmed bricks to the chart
+    if len(confirmed_bricks) > 0:
         fig.add_trace(go.Candlestick(
-            x=[i for i in range(len(truly_confirmed_bricks))],
-            open=truly_confirmed_bricks['open'].values,
-            high=truly_confirmed_bricks['high'].values,
-            low=truly_confirmed_bricks['low'].values,
-            close=truly_confirmed_bricks['close'].values,
+            x=[i for i in range(len(confirmed_bricks))],
+            open=confirmed_bricks['open'].values,
+            high=confirmed_bricks['high'].values,
+            low=confirmed_bricks['low'].values,
+            close=confirmed_bricks['close'].values,
             increasing_line_color='green',
             decreasing_line_color='red',
             name='Confirmed Bricks',
             whiskerwidth=1
         ))
     
-    # Add current minute bricks (formed in this minute - VISIBLE but not for EMA)
-    if len(current_minute_bricks) > 0:
-        fig.add_trace(go.Candlestick(
-            x=[i + len(truly_confirmed_bricks) for i in range(len(current_minute_bricks))],
-            open=current_minute_bricks['open'].values,
-            high=current_minute_bricks['high'].values,
-            low=current_minute_bricks['low'].values,
-            close=current_minute_bricks['close'].values,
-            increasing_line_color='rgba(128, 128, 128, 0.5)',  # Gray with 50% opacity
-            decreasing_line_color='rgba(128, 128, 128, 0.5)', # Gray with 50% opacity
-            name='Current Minute Bricks',
-            increasing_fillcolor='rgba(128, 128, 128, 0.2)',
-            decreasing_fillcolor='rgba(128, 128, 128, 0.2)',
-            line=dict(width=1)
-        ))
-    
-    # Add the currently forming unconfirmed brick (the very latest forming brick - VISIBLE but not for EMA)
-    if unconfirmed_list is not None and len(unconfirmed_list) > 0:
-        # Show ALL unconfirmed bricks from current minute (the formation process)
-        for i, brick in enumerate(unconfirmed_list):
-            fig.add_trace(go.Candlestick(
-                x=[len(truly_confirmed_bricks) + len(current_minute_bricks) + i],
-                open=[brick['open']],
-                high=[brick['high']],
-                low=[brick['low']],
-                close=[brick['close']],
-                increasing_line_color='rgba(128, 128, 128, 0.5)',  # Gray with 50% opacity
-                decreasing_line_color='rgba(128, 128, 128, 0.5)', # Gray with 50% opacity
-                name=f'Unconfirmed Brick {i}' if i > 0 else 'Unconfirmed',
-                increasing_fillcolor='rgba(128, 128, 128, 0.2)',
-                decreasing_fillcolor='rgba(128, 128, 128, 0.2)',
-                line=dict(width=1),
-                showlegend=(i == 0)  # Only show legend for first unconfirmed brick to avoid clutter
-            ))
-    
-    # Calculate EMA aligned with truly confirmed bricks for plotting
+    # Calculate EMA aligned with confirmed bricks for plotting
     if len(ema_values) > 0:
         # EMA[0] corresponds to the 9th confirmed close price (index 8)
         # So for confirmed brick i, EMA value is ema_values[i-8] when i >= 8
         ema_x = []
         ema_y = []
-        for i in range(len(truly_confirmed_bricks)):
+        for i in range(len(confirmed_bricks)):
             if i >= 8:  # Start from the 9th element (index 8)
                 ema_idx = i - 8
                 if ema_idx < len(ema_values):
@@ -353,69 +295,39 @@ def update_chart(symbol, timeframe, box_size, num_bricks, n_intervals):
                 line=dict(color='orange', width=2)
             ))
     
-    # Calculate price range for y-axis (from all visible bricks)
+    # Calculate price range for y-axis (from confirmed bricks only)
     price_min = float('inf')
     price_max = float('-inf')
     
-    if len(truly_confirmed_bricks) > 0:
-        price_min = min(price_min, truly_confirmed_bricks['low'].min())
-        price_max = max(price_max, truly_confirmed_bricks['high'].max())
+    if len(confirmed_bricks) > 0:
+        price_min = min(price_min, confirmed_bricks['low'].min())
+        price_max = max(price_max, confirmed_bricks['high'].max())
     
-    if len(current_minute_bricks) > 0:
-        price_min = min(price_min, current_minute_bricks['low'].min())
-        price_max = max(price_max, current_minute_bricks['high'].max())
+    if price_min == float('inf'): price_min = 0
+    if price_max == float('-inf'): price_max = 1
     
-    if unconfirmed_list is not None and len(unconfirmed_list) > 0:
-        unconfirmed_lows = [brick['low'] for brick in unconfirmed_list]
-        unconfirmed_highs = [brick['high'] for brick in unconfirmed_list]
-        price_min = min(price_min, min(unconfirmed_lows))
-        price_max = max(price_max, max(unconfirmed_highs))
-    
-    # Handle edge case where no data
-    if price_min == float('inf'):
-        price_min = 0
-    if price_max == float('-inf'):
-        price_max = 1
-    
-    # Format prices to exactly 2 decimal places as requested
     fig.update_layout(
         title=f"Renko Chart - {symbol} (Box Size: ${box_size})",
         yaxis_title="Price",
         xaxis_title="Brick Number",
         height=600,
-        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),  # Hidden X-axis as requested
+        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),  
         yaxis=dict(
-            tickformat='.2f',  # Exactly 2 decimal places
+            tickformat='.2f',  
             range=[price_min - box_size, price_max + box_size]
         ),
         margin=dict(l=50, r=50, t=50, b=50)
     )
     
-    # Prepare display dataframe - show ALL bricks (confirmed + current minute + unconfirmed)
-    # but mark their confirmation status correctly for the table
-    display_parts = []
-    if len(truly_confirmed_bricks) > 0:
-        display_parts.append(truly_confirmed_bricks)
-    if len(current_minute_bricks) > 0:
-        display_parts.append(current_minute_bricks)  # Already have correct confirmed status
-    if unconfirmed_list is not None and len(unconfirmed_list) > 0:
-        unconfirmed_df = pd.DataFrame(unconfirmed_list)
-        display_parts.append(unconfirmed_df)
-    
-    if len(display_parts) > 0:
-        display_df = pd.concat(display_parts, ignore_index=True)
-    else:
-        display_df = pd.DataFrame()
-    
-    price_format = '.2f'  # Always 2 decimal places as requested
+    # Prepare display dataframe - show ONLY confirmed bricks
+    display_df = confirmed_bricks.copy()
+    price_format = '.2f' 
     
     table_rows = []
     for _, row in display_df.tail(20).iterrows():
         brick_num = int(row['brick_num'])
         ema_val = "-"
-        if row['confirmed'] and len(ema_values) > 0:
-            # EMA[0] corresponds to the close price at index (period-1) in close_prices_for_ema
-            # So for brick_num, we need EMA[brick_num - (period-1)] if brick_num >= (period-1)
+        if len(ema_values) > 0:
             ema_idx = brick_num - (9 - 1)  # period is 9
             if 0 <= ema_idx < len(ema_values):
                 ema_val = f"{ema_values[ema_idx]:{price_format}}"
@@ -426,7 +338,7 @@ def update_chart(symbol, timeframe, box_size, num_bricks, n_intervals):
             html.Td(f"{row['close']:{price_format}}"),
             html.Td(f"{row['high']:{price_format}}"),
             html.Td(f"{row['low']:{price_format}}"),
-            html.Td("Unconfirmed" if not row['confirmed'] else "Confirmed"),
+            html.Td("Confirmed"), 
             html.Td(ema_val)
         ]))
     
