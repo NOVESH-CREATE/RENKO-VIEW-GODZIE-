@@ -207,78 +207,221 @@ void ProcessTradingLogic()
       // Create a unique ID for this setup
       string setup_id = setup.type + "_" + IntegerToString(setup.c1_num) + "_" + IntegerToString(setup.c2_num);
       
-      // Check if we should cancel unfilled orders based on C3 logic
-      bool should_cancel = StringFind(setup.status, "CANCELED") >= 0;
-      
-      // If we should cancel and have an active order, cancel it
-      if(should_cancel)
+      // --- HANDLE CANCELED/INVALIDATED ORDERS ---
+      if(StringFind(setup.status, "CANCELED") >= 0)
       {
-         // Cancel order logic would go here
-         // For simplicity, we rely on not re-placing orders that should be cancelled
-         continue; // Skip placing new order
+         Print("Setup invalidated: ", setup_id, " - ", setup.invalidation_details);
+         
+         // Cancel any pending orders for this setup
+         CancelOrdersByComment(setup_id);
+         
+         // Close any filled positions for this setup
+         ClosePositionsByComment(setup_id);
+         
+         continue; // Skip to next setup
       }
       
-      // Skip if we already have an active order for this setup
-      // In a real implementation, we would check for existing orders
-      
-      // Only trade if status indicates we should place an order
-      if(StringFind(setup.status, "Pending Order Placed") >= 0 || 
-         StringFind(setup.status, "STOPPED OUT -> RE-ENTRY PLACED") >= 0)
+      // --- HANDLE FILLED POSITIONS (Manage active trades) ---
+      if(StringFind(setup.status, "FILLED") >= 0)
       {
-         double entry_price = setup.entry;
-         double sl_price = setup.sl;
-         double tp_price = setup.tp;
+         // Position is active, no new action needed
+         // (SL/TP are already set on the position)
+         Print("Setup FILLED: ", setup_id, " - Trade is active");
+         continue;
+      }
+      
+      // --- HANDLE STOPPED OUT -> RE-ENTRY PLACED ---
+      if(StringFind(setup.status, "STOPPED OUT -> RE-ENTRY PLACED") >= 0)
+      {
+         Print("Setup stopped out: ", setup_id, " - ", setup.invalidation_details);
          
-         // Calculate SL distance for lot sizing
-         double sl_distance = MathAbs(entry_price - sl_price);
-         
-         // Calculate lot size based on 1% risk
-         double lot_size = CalculateLotSize(RiskPercent, sl_distance, _Symbol);
-         
-         // Determine order type based on setup
-         if(StringFind(setup.type, "BEARISH") >= 0)
+         // Check if we already have a re-entry order
+         if(!HasOrderWithComment(setup_id + "_REENTRY"))
          {
-            // Sell stop order
-            PlaceStopOrder(_Symbol, ORDER_TYPE_SELL_STOP, entry_price, sl_price, tp_price, lot_size, 
-                          "BEARISH_SETUP_C1"+IntegerToString(setup.c1_num)+"_C2"+IntegerToString(setup.c2_num));
+            double entry_price = setup.entry;
+            double sl_price = setup.sl;
+            double tp_price = setup.tp;
+            
+            // Calculate SL distance for lot sizing
+            double sl_distance = MathAbs(entry_price - sl_price);
+            
+            // Calculate lot size based on 1% risk
+            double lot_size = CalculateLotSize(RiskPercent, sl_distance, _Symbol);
+            
+            // Determine order type based on setup
+            if(StringFind(setup.type, "BEARISH") >= 0)
+            {
+               // Sell stop order for re-entry
+               PlaceStopOrder(_Symbol, ORDER_TYPE_SELL_STOP, entry_price, sl_price, tp_price, lot_size, 
+                             setup_id + "_REENTRY");
+            }
+            else
+            {
+               // Buy stop order for re-entry
+               PlaceStopOrder(_Symbol, ORDER_TYPE_BUY_STOP, entry_price, sl_price, tp_price, lot_size, 
+                             setup_id + "_REENTRY");
+            }
          }
-         else
+         continue;
+      }
+      
+      // --- HANDLE PENDING/UNFILLED ORDERS ---
+      if(StringFind(setup.status, "Pending") >= 0)
+      {
+         // Check if we already have a pending order for this setup
+         if(!HasOrderWithComment(setup_id))
          {
-            // Buy stop order
-            PlaceStopOrder(_Symbol, ORDER_TYPE_BUY_STOP, entry_price, sl_price, tp_price, lot_size, 
-                          "BULLISH_SETUP_C1"+IntegerToString(setup.c1_num)+"_C2"+IntegerToString(setup.c2_num));
+            double entry_price = setup.entry;
+            double sl_price = setup.sl;
+            double tp_price = setup.tp;
+            
+            // Calculate SL distance for lot sizing
+            double sl_distance = MathAbs(entry_price - sl_price);
+            
+            // Calculate lot size based on 1% risk
+            double lot_size = CalculateLotSize(RiskPercent, sl_distance, _Symbol);
+            
+            // Determine order type based on setup
+            if(StringFind(setup.type, "BEARISH") >= 0)
+            {
+               // Sell stop order
+               PlaceStopOrder(_Symbol, ORDER_TYPE_SELL_STOP, entry_price, sl_price, tp_price, lot_size, 
+                             setup_id);
+            }
+            else
+            {
+               // Buy stop order
+               PlaceStopOrder(_Symbol, ORDER_TYPE_BUY_STOP, entry_price, sl_price, tp_price, lot_size, 
+                             setup_id);
+            }
+         }
+         continue;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check if order exists with comment                               |
+//+------------------------------------------------------------------+
+bool HasOrderWithComment(string comment)
+{
+   int total = OrdersTotal();
+   for(int i = 0; i < total; i++)
+   {
+      if(OrderGetTicket(i) > 0)
+      {
+         if(StringFind(OrderGetString(ORDER_COMMENT), comment) >= 0)
+            return(true);
+      }
+   }
+   return(false);
+}
+
+//+------------------------------------------------------------------+
+//| Cancel orders by comment                                         |
+//+------------------------------------------------------------------+
+void CancelOrdersByComment(string comment)
+{
+   int total = OrdersTotal();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      if(OrderGetTicket(i) > 0)
+      {
+         string order_comment = OrderGetString(ORDER_COMMENT);
+         if(StringFind(order_comment, comment) >= 0)
+         {
+            if(OrderGetInteger(ORDER_STATE) == ORDER_STATE_PLACED)
+            {
+               MqlTradeRequest request;
+               MqlTradeResult result;
+               
+               ZeroMemory(request);
+               ZeroMemory(result);
+               
+               request.action = TRADE_ACTION_REMOVE;
+               request.order = OrderGetTicket(i);
+               
+               if(OrderSend(request, result))
+               {
+                  Print("Order cancelled: ", order_comment, " Ticket: ", OrderGetTicket(i));
+               }
+               else
+               {
+                  Print("Failed to cancel order: ", order_comment, " Error: ", GetLastError());
+               }
+            }
          }
       }
-      // Handle re-entry logic when SL is hit before C3 close
-      else if(StringFind(setup.status, "STOPPED OUT -> RE-ENTRY PLACED") >= 0)
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close positions by comment                                       |
+//+------------------------------------------------------------------+
+void ClosePositionsByComment(string comment)
+{
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      if(PositionGetTicket(i) > 0)
       {
-         // Check if we already have an active order for this setup
-         // In a real implementation, we would check for existing orders
-         // For now, we'll always place the re-entry order
-         
-         // Place a new order at the same levels for re-entry
-         double entry_price = setup.entry;
-         double sl_price = setup.sl;
-         double tp_price = setup.tp;
-         
-         // Calculate SL distance for lot sizing
-         double sl_distance = MathAbs(entry_price - sl_price);
-         
-         // Calculate lot size based on 1% risk
-         double lot_size = CalculateLotSize(RiskPercent, sl_distance, _Symbol);
-         
-         // Determine order type based on setup
-         if(StringFind(setup.type, "BEARISH") >= 0)
+         string position_comment = PositionGetString(POSITION_COMMENT);
+         if(StringFind(position_comment, comment) >= 0)
          {
-            // Sell stop order for re-entry
-            PlaceStopOrder(_Symbol, ORDER_TYPE_SELL_STOP, entry_price, sl_price, tp_price, lot_size, 
-                          "BEARISH_REENTRY_C1"+IntegerToString(setup.c1_num)+"_C2"+IntegerToString(setup.c2_num));
-         }
-         else
-         {
-            // Buy stop order for re-entry
-            PlaceStopOrder(_Symbol, ORDER_TYPE_BUY_STOP, entry_price, sl_price, tp_price, lot_size, 
-                          "BULLISH_REENTRY_C1"+IntegerToString(setup.c1_num)+"_C2"+IntegerToString(setup.c2_num));
+            if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+            {
+               // Sell to close
+               MqlTradeRequest request;
+               MqlTradeResult result;
+               
+               ZeroMemory(request);
+               ZeroMemory(result);
+               
+               request.action = TRADE_ACTION_DEAL;
+               request.symbol = _Symbol;
+               request.volume = PositionGetDouble(POSITION_VOLUME);
+               request.type = ORDER_TYPE_SELL;
+               request.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+               request.deviation = 10;
+               request.magic = 234000;
+               request.comment = "CLOSE_" + position_comment;
+               
+               if(OrderSend(request, result))
+               {
+                  Print("BUY position closed: ", position_comment, " Ticket: ", PositionGetTicket(i));
+               }
+               else
+               {
+                  Print("Failed to close BUY position: ", position_comment, " Error: ", GetLastError());
+               }
+            }
+            else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+            {
+               // Buy to close
+               MqlTradeRequest request;
+               MqlTradeResult result;
+               
+               ZeroMemory(request);
+               ZeroMemory(result);
+               
+               request.action = TRADE_ACTION_DEAL;
+               request.symbol = _Symbol;
+               request.volume = PositionGetDouble(POSITION_VOLUME);
+               request.type = ORDER_TYPE_BUY;
+               request.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+               request.deviation = 10;
+               request.magic = 234000;
+               request.comment = "CLOSE_" + position_comment;
+               
+               if(OrderSend(request, result))
+               {
+                  Print("SELL position closed: ", position_comment, " Ticket: ", PositionGetTicket(i));
+               }
+               else
+               {
+                  Print("Failed to close SELL position: ", position_comment, " Error: ", GetLastError());
+               }
+            }
          }
       }
    }
