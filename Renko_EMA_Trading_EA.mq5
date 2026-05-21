@@ -35,6 +35,8 @@ struct SetupInfo
    string      status;    // Current status
    string      invalidation_details; // Details about invalidation
    int         c2_idx;    // Index in confirmed bricks array
+   bool        c3_exists; // Whether C3 has formed
+   double      c3_close;  // C3 close price for exit validation
 };
 
 // Global arrays
@@ -199,7 +201,7 @@ void ProcessTradingLogic()
       return;
    }
    
-   // Process each setup for trading
+   // --- STEP 1: PLACE NEW ORDERS based on C1+C2 (don't wait for C3) ---
    for(int i = 0; i < ArraySize(setups); i++)
    {
       SetupInfo setup = setups[i];
@@ -207,68 +209,10 @@ void ProcessTradingLogic()
       // Create a unique ID for this setup
       string setup_id = setup.type + "_" + IntegerToString(setup.c1_num) + "_" + IntegerToString(setup.c2_num);
       
-      // --- HANDLE CANCELED/INVALIDATED ORDERS ---
-      if(StringFind(setup.status, "CANCELED") >= 0)
+      // Only place if pending (C1+C2 valid, don't wait for C3)
+      if(StringFind(setup.status, "Pending Order Placed") >= 0)
       {
-         Print("Setup invalidated: ", setup_id, " - ", setup.invalidation_details);
-         
-         // Cancel any pending orders for this setup
-         CancelOrdersByComment(setup_id);
-         
-         // Close any filled positions for this setup
-         ClosePositionsByComment(setup_id);
-         
-         continue; // Skip to next setup
-      }
-      
-      // --- HANDLE FILLED POSITIONS (Manage active trades) ---
-      if(StringFind(setup.status, "FILLED") >= 0)
-      {
-         // Position is active, no new action needed
-         // (SL/TP are already set on the position)
-         Print("Setup FILLED: ", setup_id, " - Trade is active");
-         continue;
-      }
-      
-      // --- HANDLE STOPPED OUT -> RE-ENTRY PLACED ---
-      if(StringFind(setup.status, "STOPPED OUT -> RE-ENTRY PLACED") >= 0)
-      {
-         Print("Setup stopped out: ", setup_id, " - ", setup.invalidation_details);
-         
-         // Check if we already have a re-entry order
-         if(!HasOrderWithComment(setup_id + "_REENTRY"))
-         {
-            double entry_price = setup.entry;
-            double sl_price = setup.sl;
-            double tp_price = setup.tp;
-            
-            // Calculate SL distance for lot sizing
-            double sl_distance = MathAbs(entry_price - sl_price);
-            
-            // Calculate lot size based on 1% risk
-            double lot_size = CalculateLotSize(RiskPercent, sl_distance, _Symbol);
-            
-            // Determine order type based on setup
-            if(StringFind(setup.type, "BEARISH") >= 0)
-            {
-               // Sell stop order for re-entry
-               PlaceStopOrder(_Symbol, ORDER_TYPE_SELL_STOP, entry_price, sl_price, tp_price, lot_size, 
-                             setup_id + "_REENTRY");
-            }
-            else
-            {
-               // Buy stop order for re-entry
-               PlaceStopOrder(_Symbol, ORDER_TYPE_BUY_STOP, entry_price, sl_price, tp_price, lot_size, 
-                             setup_id + "_REENTRY");
-            }
-         }
-         continue;
-      }
-      
-      // --- HANDLE PENDING/UNFILLED ORDERS ---
-      if(StringFind(setup.status, "Pending") >= 0)
-      {
-         // Check if we already have a pending order for this setup
+         // Check if order already exists
          if(!HasOrderWithComment(setup_id))
          {
             double entry_price = setup.entry;
@@ -281,21 +225,70 @@ void ProcessTradingLogic()
             // Calculate lot size based on 1% risk
             double lot_size = CalculateLotSize(RiskPercent, sl_distance, _Symbol);
             
+            Print("PLACING NEW ORDER (C1+C2 valid): ", setup_id, 
+                  " Entry: ", entry_price, " SL: ", sl_price, " TP: ", tp_price);
+            
             // Determine order type based on setup
             if(StringFind(setup.type, "BEARISH") >= 0)
             {
                // Sell stop order
-               PlaceStopOrder(_Symbol, ORDER_TYPE_SELL_STOP, entry_price, sl_price, tp_price, lot_size, 
-                             setup_id);
+               PlaceStopOrder(_Symbol, ORDER_TYPE_SELL_STOP, entry_price, sl_price, tp_price, lot_size, setup_id);
             }
             else
             {
                // Buy stop order
-               PlaceStopOrder(_Symbol, ORDER_TYPE_BUY_STOP, entry_price, sl_price, tp_price, lot_size, 
-                             setup_id);
+               PlaceStopOrder(_Symbol, ORDER_TYPE_BUY_STOP, entry_price, sl_price, tp_price, lot_size, setup_id);
             }
          }
-         continue;
+      }
+   }
+   
+   // --- STEP 2: USE C3 TO MANAGE/CLOSE POSITIONS ---
+   for(int i = 0; i < ArraySize(setups); i++)
+   {
+      SetupInfo setup = setups[i];
+      
+      // Only manage if C3 has formed
+      if(setup.c3_exists)
+      {
+         string setup_id = setup.type + "_" + IntegerToString(setup.c1_num) + "_" + IntegerToString(setup.c2_num);
+         
+         Print("C3 HAS FORMED for setup: ", setup_id, " - Checking exit conditions...");
+         
+         // --- BEARISH SETUP EXIT CONDITIONS ---
+         if(StringFind(setup.type, "BEARISH") >= 0)
+         {
+            // C2 is bullish, so:
+            double c2_high = setup.entry + (setup.sl - setup.entry); // Reconstruct C2 high
+            
+            // Exit condition 1: C3 closed above C2 High (strategy invalidated)
+            if(setup.c3_close > c2_high)
+            {
+               Print("C3 INVALIDATED BEARISH SETUP: ", setup_id, 
+                     " - C3 closed above C2 high. CLOSING POSITION!");
+               ClosePositionsByComment(setup_id);
+            }
+         }
+         
+         // --- BULLISH SETUP EXIT CONDITIONS ---
+         if(StringFind(setup.type, "BULLISH") >= 0)
+         {
+            // C2 is bearish, so:
+            double c2_low = setup.entry - (setup.entry - setup.sl); // Reconstruct C2 low
+            
+            // Exit condition 2: C3 closed below C2 Low (strategy invalidated)
+            if(setup.c3_close < c2_low)
+            {
+               Print("C3 INVALIDATED BULLISH SETUP: ", setup_id, 
+                     " - C3 closed below C2 low. CLOSING POSITION!");
+               ClosePositionsByComment(setup_id);
+            }
+         }
+         
+         // Note: SL/TP are already set on the order, so:
+         // - If C3 hits SL, platform closes automatically
+         // - If C3 reaches TP, platform closes automatically
+         // - We only manually close if strategy invalidates (C3 closes outside setup bounds)
       }
    }
 }
@@ -315,44 +308,6 @@ bool HasOrderWithComment(string comment)
       }
    }
    return(false);
-}
-
-//+------------------------------------------------------------------+
-//| Cancel orders by comment                                         |
-//+------------------------------------------------------------------+
-void CancelOrdersByComment(string comment)
-{
-   int total = OrdersTotal();
-   for(int i = total - 1; i >= 0; i--)
-   {
-      if(OrderGetTicket(i) > 0)
-      {
-         string order_comment = OrderGetString(ORDER_COMMENT);
-         if(StringFind(order_comment, comment) >= 0)
-         {
-            if(OrderGetInteger(ORDER_STATE) == ORDER_STATE_PLACED)
-            {
-               MqlTradeRequest request;
-               MqlTradeResult result;
-               
-               ZeroMemory(request);
-               ZeroMemory(result);
-               
-               request.action = TRADE_ACTION_REMOVE;
-               request.order = OrderGetTicket(i);
-               
-               if(OrderSend(request, result))
-               {
-                  Print("Order cancelled: ", order_comment, " Ticket: ", OrderGetTicket(i));
-               }
-               else
-               {
-                  Print("Failed to cancel order: ", order_comment, " Error: ", GetLastError());
-               }
-            }
-         }
-      }
-   }
 }
 
 //+------------------------------------------------------------------+
@@ -388,7 +343,7 @@ void ClosePositionsByComment(string comment)
                
                if(OrderSend(request, result))
                {
-                  Print("BUY position closed: ", position_comment, " Ticket: ", PositionGetTicket(i));
+                  Print("C3 EXIT: BUY position closed: ", position_comment);
                }
                else
                {
@@ -415,7 +370,7 @@ void ClosePositionsByComment(string comment)
                
                if(OrderSend(request, result))
                {
-                  Print("SELL position closed: ", position_comment, " Ticket: ", PositionGetTicket(i));
+                  Print("C3 EXIT: SELL position closed: ", position_comment);
                }
                else
                {
@@ -695,24 +650,26 @@ bool ScanEntrySetups(const double &opens[], const double &closes[], const double
          {
             // Valid Bearish Setup Found!
             double entry_price = c1_open;
-            // SL has fixed_sl_buffer directly incorporated "in risk" calculations
             double sl_price = c2_high + fixed_sl_buffer;
             double risk = sl_price - entry_price;
             double tp_price = (risk > 0) ? entry_price - (3 * risk) : entry_price;
             
-            // Check Invalidation / Filled / Stopped Out state by Candle 3 (C3)
+            // Check if C3 has formed
             string status = "Pending Order Placed";
             string invalidation_details = "Waiting for Candle 3 (C3) to form or close.";
+            bool c3_exists = false;
+            double c3_close_val = 0.0;
             
             if(i + 1 < ArraySize(opens))
             {
+               c3_exists = true;
                double c3_open = opens[i+1];
-               double c3_close = closes[i+1];
+               c3_close_val = closes[i+1];
                double c3_high = highs[i+1];
                double c3_low = lows[i+1];
                
-               double c3_low_val = MathMin(c3_open, c3_close);
-               double c3_high_val = MathMax(c3_open, c3_close);
+               double c3_low_val = MathMin(c3_open, c3_close_val);
+               double c3_high_val = MathMax(c3_open, c3_close_val);
                
                // 1. Did Candle 3 fill our entry?
                bool is_filled = (c3_low_val <= entry_price && entry_price <= c3_high_val);
@@ -723,28 +680,27 @@ bool ScanEntrySetups(const double &opens[], const double &closes[], const double
                   bool is_stopped_out = (c3_high_val >= sl_price);
                   if(is_stopped_out)
                   {
-                     status = "STOPPED OUT -> RE-ENTRY PLACED";
-                     invalidation_details = "C3 filled entry at "+DoubleToString(entry_price,2)+" and hit SL at "+DoubleToString(sl_price,2)+". "+
-                                           "New trade immediately placed at same entry with "+DoubleToString(fixed_sl_buffer,2)+" buffer.";
+                     status = "STOPPED OUT";
+                     invalidation_details = "C3 filled entry and hit SL. Position stopped out.";
                   }
                   else
                   {
                      status = "FILLED";
-                     invalidation_details = "C3 filled the trade at "+DoubleToString(entry_price,2)+". Trade is active!";
+                     invalidation_details = "C3 filled the trade. Trade is active!";
                   }
                }
                else
                {
                   // 2. If NOT filled, check if C3 closed above C2 High (Invalidation)
-                  if(c3_close > c2_high)
+                  if(c3_close_val > c2_high)
                   {
                      status = "CANCELED (Invalidated)";
-                     invalidation_details = "C3 closed above C2 high ("+DoubleToString(c3_close,2)+" > "+DoubleToString(c2_high,2)+") without filling. Order deleted.";
+                     invalidation_details = "C3 closed above C2 high without filling. Strategy invalidated.";
                   }
                   else
                   {
-                     status = "Pending (Unfilled)";
-                     invalidation_details = "C3 did not fill Entry nor close above C2 High. Order remains pending.";
+                     status = "Pending Order Placed";
+                     invalidation_details = "C3 did not fill or invalidate. Order remains pending.";
                   }
                }
             }
@@ -764,6 +720,8 @@ bool ScanEntrySetups(const double &opens[], const double &closes[], const double
             setups[idx].status = status;
             setups[idx].invalidation_details = invalidation_details;
             setups[idx].c2_idx = i;
+            setups[idx].c3_exists = c3_exists;
+            setups[idx].c3_close = c3_close_val;
          }
       }
    
@@ -780,24 +738,26 @@ bool ScanEntrySetups(const double &opens[], const double &closes[], const double
          {
             // Valid Bullish Setup Found!
             double entry_price = c1_open;
-            // SL has fixed_sl_buffer directly incorporated "in risk" calculations
             double sl_price = c2_low - fixed_sl_buffer;
             double risk = entry_price - sl_price;
             double tp_price = (risk > 0) ? entry_price + (3 * risk) : entry_price;
             
-            // Check Invalidation / Filled / Stopped Out state by Candle 3 (C3)
+            // Check if C3 has formed
             string status = "Pending Order Placed";
             string invalidation_details = "Waiting for Candle 3 (C3) to form or close.";
+            bool c3_exists = false;
+            double c3_close_val = 0.0;
             
             if(i + 1 < ArraySize(opens))
             {
+               c3_exists = true;
                double c3_open = opens[i+1];
-               double c3_close = closes[i+1];
+               c3_close_val = closes[i+1];
                double c3_high = highs[i+1];
                double c3_low = lows[i+1];
                
-               double c3_low_val = MathMin(c3_open, c3_close);
-               double c3_high_val = MathMax(c3_open, c3_close);
+               double c3_low_val = MathMin(c3_open, c3_close_val);
+               double c3_high_val = MathMax(c3_open, c3_close_val);
                
                // 1. Did Candle 3 fill our entry?
                bool is_filled = (c3_low_val <= entry_price && entry_price <= c3_high_val);
@@ -808,28 +768,27 @@ bool ScanEntrySetups(const double &opens[], const double &closes[], const double
                   bool is_stopped_out = (c3_low_val <= sl_price);
                   if(is_stopped_out)
                   {
-                     status = "STOPPED OUT -> RE-ENTRY PLACED";
-                     invalidation_details = "C3 filled entry at "+DoubleToString(entry_price,2)+" and hit SL at "+DoubleToString(sl_price,2)+". "+
-                                           "New trade immediately placed at same entry with "+DoubleToString(fixed_sl_buffer,2)+" buffer.";
+                     status = "STOPPED OUT";
+                     invalidation_details = "C3 filled entry and hit SL. Position stopped out.";
                   }
                   else
                   {
                      status = "FILLED";
-                     invalidation_details = "C3 filled the trade at "+DoubleToString(entry_price,2)+". Trade is active!";
+                     invalidation_details = "C3 filled the trade. Trade is active!";
                   }
                }
                else
                {
                   // 2. If NOT filled, check if C3 closed below C2 Low (Invalidation)
-                  if(c3_close < c2_low)
+                  if(c3_close_val < c2_low)
                   {
                      status = "CANCELED (Invalidated)";
-                     invalidation_details = "C3 closed below C2 low ("+DoubleToString(c3_close,2)+" < "+DoubleToString(c2_low,2)+") without filling. Order deleted.";
+                     invalidation_details = "C3 closed below C2 low without filling. Strategy invalidated.";
                   }
                   else
                   {
-                     status = "Pending (Unfilled)";
-                     invalidation_details = "C3 did not fill Entry nor close below C2 Low. Order remains pending.";
+                     status = "Pending Order Placed";
+                     invalidation_details = "C3 did not fill or invalidate. Order remains pending.";
                   }
                }
             }
@@ -849,6 +808,8 @@ bool ScanEntrySetups(const double &opens[], const double &closes[], const double
             setups[idx].status = status;
             setups[idx].invalidation_details = invalidation_details;
             setups[idx].c2_idx = i;
+            setups[idx].c3_exists = c3_exists;
+            setups[idx].c3_close = c3_close_val;
          }
       }
    }
